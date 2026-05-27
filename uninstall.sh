@@ -15,22 +15,26 @@ stop_app() {
 }
 
 if ! rpm -q seventeenlands-tray >/dev/null 2>&1 \
-   && [[ ! -x "${HOME}/.local/bin/seventeenlands-tray" ]]; then
+   && [[ ! -x "${HOME}/.local/bin/seventeenlands-tray" ]] \
+   && [[ ! -f "${HOME}/.config/systemd/user/seventeenlands-tray.service" ]]; then
   say "Nothing to uninstall."
   exit 0
 fi
 
 say "Removing 17Lands"
 stop_app
+systemctl --user disable --now seventeenlands-tray.service 2>/dev/null || true
 rpm -q seventeenlands-tray >/dev/null 2>&1 && sudo dnf remove -y seventeenlands-tray
 rm -f "${HOME}/.local/bin/seventeenlands-tray"
 rm -f "${HOME}/.config/autostart/seventeenlands-tray.desktop"
+rm -f "${HOME}/.config/systemd/user/seventeenlands-tray.service"
 rm -f "${HOME}/.local/share/applications/seventeenlands-tray.desktop"
 rm -rf "${HOME}/.local/share/seventeenlands-tray"
 rm -f "${HOME}/.local/share/icons/hicolor/scalable/apps/seventeenlands-tray.svg"
 rm -f "${HOME}/.local/share/icons/hicolor/48x48/apps/seventeenlands-tray.png"
 rm -f "${HOME}/.local/share/icons/hicolor/256x256/apps/seventeenlands-tray.png"
 update-desktop-database "${HOME}/.local/share/applications" 2>/dev/null || true
+systemctl --user daemon-reload 2>/dev/null || true
 
 echo
 echo "Done. Your token/config were kept."

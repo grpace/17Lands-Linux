@@ -1145,10 +1145,17 @@ class SeventeenLandsTray(QSystemTrayIcon):
         self.setIcon(app_icon)
         self.setToolTip(APP_NAME)
         self._apply_snapshot(self._snapshot, self._icon_starting)
-        self.show()
+        self._ensure_tray_visible()
         if not defer_start:
             self.start_follower()
         QTimer.singleShot(1500, self._refresh_tray_relevance)
+
+    def _ensure_tray_visible(self, attempts: int = 0) -> None:
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.show()
+            return
+        if attempts < 30:
+            QTimer.singleShot(2000, lambda: self._ensure_tray_visible(attempts + 1))
 
     def _refresh_tray_relevance(self) -> None:
         self._tray_dbus_status.reset()

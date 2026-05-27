@@ -92,11 +92,11 @@ install_files() {
   local share="${HOME}/.local/share/seventeenlands-tray"
   local icon="${HOME}/.local/share/icons/hicolor"
   local apps="${HOME}/.local/share/applications"
-  local auto="${HOME}/.config/autostart"
+  local unit_dir="${HOME}/.config/systemd/user"
 
   say "Installing to ~/.local"
   mkdir -p "${HOME}/.local/bin" "${share}" "${icon}/scalable/apps" \
-    "${icon}/48x48/apps" "${icon}/256x256/apps" "${apps}" "${auto}"
+    "${icon}/48x48/apps" "${icon}/256x256/apps" "${apps}" "${unit_dir}"
 
   install -m 755 "${ROOT}/seventeenlands_tray.py" "${TRAY_BIN}"
   install -m 644 "${ROOT}/assets/seventeenlands-tray.svg" "${share}/seventeenlands-tray.svg"
@@ -114,8 +114,7 @@ i.pixmap(256, 256).save("${icon}/256x256/apps/seventeenlands-tray.png")
 i.pixmap(48, 48).save("${icon}/48x48/apps/seventeenlands-tray.png")
 PY
 
-  for dest in "${apps}/seventeenlands-tray.desktop" "${auto}/seventeenlands-tray.desktop"; do
-    cat > "${dest}" <<EOF
+  cat > "${apps}/seventeenlands-tray.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=17Lands
@@ -126,11 +125,43 @@ StartupWMClass=17Lands
 StartupNotify=false
 X-KDE-StartupNotify=false
 EOF
-  done
-  printf 'X-KDE-autostart-phase=2\nHidden=false\n' >> "${auto}/seventeenlands-tray.desktop"
+
+  cat > "${unit_dir}/seventeenlands-tray.service" <<EOF
+[Unit]
+Description=17Lands system tray
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 5
+ExecStart=${TRAY_BIN}
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+
+  rm -f "${HOME}/.config/autostart/seventeenlands-tray.desktop"
 
   update-desktop-database "${apps}" 2>/dev/null || true
   gtk-update-icon-cache "${HOME}/.local/share/icons/hicolor" 2>/dev/null || true
+}
+
+disable_legacy_services() {
+  local svc
+  for svc in seventeenlands 17lands; do
+    if systemctl --user is-enabled "${svc}.service" &>/dev/null; then
+      say "Disabling old ${svc}.service (tray manages the client now)"
+      systemctl --user disable --now "${svc}.service" 2>/dev/null || true
+    fi
+  done
+}
+
+enable_autostart() {
+  systemctl --user daemon-reload
+  systemctl --user enable seventeenlands-tray.service
 }
 
 configured() {
@@ -156,6 +187,8 @@ ensure_deps
 say "Installing seventeenlands"
 python3 -m pip install --user --upgrade pip seventeenlands
 install_files
+disable_legacy_services
+enable_autostart
 start_app
 
 echo

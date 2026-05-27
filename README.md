@@ -14,7 +14,9 @@ curl -fsSL https://github.com/grpace/17Lands-Linux/raw/main/install.sh | bash
 
 Run the same command again anytime to upgrade.
 
-The installer also sets up **login autostart** for you — 17Lands will start in the background each time you sign into your desktop. No extra setup needed.
+The installer sets up a **systemd user service** so 17Lands starts a few seconds after you log in — after the KDE tray is ready. No extra setup needed.
+
+If you previously set up `seventeenlands.service` manually, the installer disables it so the tray app manages the client instead.
 
 ---
 
