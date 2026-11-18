@@ -63,7 +63,7 @@ from PyQt6.QtWidgets import (
     QWizardPage,
 )
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 APP_ID = "seventeenlands-tray"
 APP_NAME = "17Lands"
@@ -86,6 +86,7 @@ TRAY_SETTINGS_FILE = TRAY_SETTINGS_DIR / "settings.ini"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / APP_ID
 UPDATE_LOG = STATE_DIR / "update.log"
 UPDATE_MARKER = STATE_DIR / "update-pending"
+REPAIR_LOG = STATE_DIR / "client-repair.log"
 
 RESTART_DELAY_MS = 5_000
 MAX_RESTART_DELAY_MS = 300_000
@@ -687,6 +688,39 @@ def read_update_result() -> tuple[str, bool] | None:
     return previous, last.endswith("exit code 0")
 
 
+def client_install_broken(output: list[str]) -> bool:
+    """True when the client died on an import error, which is what happens to a
+    pip --user (or pipx) install after the system Python's minor version changes."""
+    return any("ModuleNotFoundError" in line or "ImportError" in line for line in output[-5:])
+
+
+def repair_script(log_file: Path) -> str:
+    """Shell script that reinstalls the seventeenlands client for the current
+    python3, the way install.sh does, without sudo. Output goes to log_file."""
+    log = shlex.quote(str(log_file))
+    return (
+        "set -o pipefail\n"
+        f"mkdir -p {shlex.quote(str(log_file.parent))}\n"
+        "{\n"
+        '  echo "== 17Lands client repair started $(date) ($(python3 --version 2>&1))"\n'
+        '  client=$(command -v seventeenlands || echo "$HOME/.local/bin/seventeenlands")\n'
+        '  target=$(readlink -f "$client")\n'
+        '  if command -v pipx >/dev/null 2>&1 && [[ "$target" == */pipx/venvs/* ]]; then\n'
+        "    pipx reinstall seventeenlands || pipx install --force seventeenlands\n"
+        "  elif python3 -m pip install --user --upgrade seventeenlands; then\n"
+        "    :\n"
+        "  elif command -v pipx >/dev/null 2>&1; then\n"
+        "    pipx install --force seventeenlands\n"
+        "  else\n"
+        "    false\n"
+        "  fi\n"
+        "  rc=$?\n"
+        '  echo "== Finished with exit code $rc"\n'
+        "  exit $rc\n"
+        f"}} > {log} 2>&1\n"
+    )
+
+
 # --- Single instance + remote commands (per-user Unix socket) ----------------
 
 
@@ -815,6 +849,7 @@ STATE_ICONS = {
     "stopped": "stopped",
     "error": "error",
     "restarting": "error",
+    "repairing": "syncing",
 }
 
 STATE_HEADLINES = {
@@ -824,6 +859,7 @@ STATE_HEADLINES = {
     "catching_up": "Catching Up",
     "starting": "Starting",
     "restarting": "Restarting",
+    "repairing": "Repairing Client",
     "waiting": "Waiting for Arena",
     "idle": "Idle",
     "stopped": "Stopped",
@@ -850,6 +886,7 @@ STATE_ACCENTS = {
     "catching_up": "#1c7ed6",
     "starting": "#e67700",
     "restarting": "#e67700",
+    "repairing": "#1c7ed6",
     "waiting": "#e67700",
     "idle": "#868e96",
     "stopped": "#e03131",
@@ -1562,6 +1599,13 @@ class SeventeenLandsTray(QSystemTrayIcon):
         self._process.errorOccurred.connect(self._on_process_error)
         self._output_tail: deque[str] = deque(maxlen=CLIENT_OUTPUT_LINES)
 
+        # Reinstalls the client when a Python upgrade breaks it (once per breakage).
+        self._repair = QProcess()
+        self._repair.setStandardInputFile(QProcess.nullDevice())
+        self._repair.finished.connect(self._on_repair_finished)
+        self._repair.errorOccurred.connect(self._on_repair_error)
+        self._repair_attempted = False
+
         self._restart_timer = QTimer(self)
         self._restart_timer.setSingleShot(True)
         self._restart_timer.timeout.connect(self.start_follower)
@@ -1816,8 +1860,8 @@ class SeventeenLandsTray(QSystemTrayIcon):
             starting=self._starting and own_running,
             session_start=self._session_start,
         )
-        if self._restart_timer.isActive() and not snapshot.process_running:
-            return  # keep the "restarting in Ns" message visible
+        if self._repairing() or (self._restart_timer.isActive() and not snapshot.process_running):
+            return  # keep the "restarting in Ns" / "repairing" message visible
         icon = self._icons[STATE_ICONS.get(snapshot.state, "starting")]
         self._apply_snapshot(snapshot, icon)
 
@@ -1825,7 +1869,7 @@ class SeventeenLandsTray(QSystemTrayIcon):
 
     def start_follower(self) -> None:
         self._restart_timer.stop()
-        if self._own_process_running():
+        if self._own_process_running() or self._repairing():
             return
 
         if self._external_client_pids():
@@ -1918,22 +1962,68 @@ class SeventeenLandsTray(QSystemTrayIcon):
 
         if time.monotonic() - self._started_monotonic >= STABLE_RUN_SECONDS:
             self._restart_delay_ms = RESTART_DELAY_MS
+            self._repair_attempted = False  # it ran fine; a later breakage gets a new repair
+        broken = client_install_broken(list(self._output_tail))
+        if broken and not self._repair_attempted:
+            self._start_repair()
+            return
         delay = self._restart_delay_ms
         self._restart_delay_ms = min(delay * 2, MAX_RESTART_DELAY_MS)
 
         detail = f"Client exited (code {exit_code}); restarting in {delay // 1000}s"
         last_line = self._output_tail[-1] if self._output_tail else ""
-        if "ModuleNotFoundError" in last_line or "ImportError" in last_line:
-            detail += "\nClient install looks broken (Python upgrade?) — re-run the installer"
+        if broken:
+            detail += (
+                "\nThe client install is broken and automatic repair failed. "
+                "Re-run the installer (details in client-repair.log)."
+            )
         elif last_line:
             detail += f"\n{last_line[:200]}"
         snapshot = ClientSnapshot(state="restarting", state_detail=detail)
         self._apply_snapshot(snapshot, self._icons["error"])
         self._restart_timer.start(delay)
 
+    # --- client repair (after a Python upgrade) ---
+
+    def _repairing(self) -> bool:
+        return self._repair.state() != QProcess.ProcessState.NotRunning
+
+    def _start_repair(self) -> None:
+        self._repair_attempted = True
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        snapshot = ClientSnapshot(
+            state="repairing",
+            state_detail="Python was upgraded, which broke the client install. "
+            "Reinstalling it now; this takes a minute.",
+        )
+        self._apply_snapshot(snapshot, self._icons["syncing"])
+        self._repair.start("/bin/bash", ["-c", repair_script(REPAIR_LOG)])
+
+    def _on_repair_error(self, error: QProcess.ProcessError) -> None:
+        if error == QProcess.ProcessError.FailedToStart:
+            self._on_repair_finished(-1, QProcess.ExitStatus.CrashExit)
+
+    def _on_repair_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
+        if exit_code == 0:
+            self.showMessage(
+                APP_NAME,
+                "Reinstalled the 17Lands client after a Python upgrade. Uploads are back on.",
+                QSystemTrayIcon.MessageIcon.Information,
+            )
+        if not self._auto_restart or self.quitting:
+            self._refresh_status()
+            return
+        self._restart_delay_ms = RESTART_DELAY_MS
+        # On failure the client exits again; with the repair already attempted,
+        # that shows the "re-run the installer" message and keeps retrying.
+        self.start_follower()
+
     def shutdown(self) -> None:
         self._auto_restart = False
         self._status_timer.stop()
+        if self._repairing():
+            self._repair.kill()
+            self._repair.waitForFinished(1000)
         self._stop_processes()
 
     def confirm_quit(self) -> None:

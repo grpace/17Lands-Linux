@@ -313,6 +313,65 @@ class UpdateTests(unittest.TestCase):
                 self.assertEqual(tray.read_update_result(), ("1.1.0", False))
 
 
+class RepairTests(unittest.TestCase):
+    def test_detects_broken_install(self):
+        traceback = [
+            "Traceback (most recent call last):",
+            '  File "/home/u/.local/bin/seventeenlands", line 3, in <module>',
+            "ModuleNotFoundError: No module named 'seventeenlands'",
+        ]
+        self.assertTrue(tray.client_install_broken(traceback))
+        self.assertTrue(tray.client_install_broken(["ImportError: cannot import name 'x'"]))
+        self.assertFalse(tray.client_install_broken(["requests.exceptions.ConnectionError"]))
+        self.assertFalse(tray.client_install_broken([]))
+
+    def run_repair(self, *, pip_rc: int, pipx: bool, pipx_link: bool = False):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, stub_bin = Path(tmp) / "home", Path(tmp) / "bin"
+            calls, log = Path(tmp) / "calls", Path(tmp) / "repair.log"
+            (home / ".local/bin").mkdir(parents=True)
+            stub_bin.mkdir()
+            stubs = {"python3": pip_rc}
+            if pipx:
+                stubs["pipx"] = 0
+            for name, code in stubs.items():
+                stub = stub_bin / name
+                stub.write_text(f'#!/bin/sh\necho "{name} $*" >> "{calls}"\nexit {code}\n')
+                stub.chmod(0o755)
+            client = home / ".local/bin/seventeenlands"
+            if pipx_link:
+                venv_bin = home / ".local/share/pipx/venvs/seventeenlands/bin"
+                venv_bin.mkdir(parents=True)
+                (venv_bin / "seventeenlands").write_text("")
+                client.symlink_to(venv_bin / "seventeenlands")
+            env = {**os.environ, "HOME": str(home), "PATH": f"{stub_bin}:/usr/bin:/bin"}
+            result = subprocess.run(["bash", "-c", tray.repair_script(log)], env=env, check=False)
+            ran = calls.read_text().splitlines() if calls.exists() else []
+            return result.returncode, ran, log.read_text()
+
+    def test_reinstalls_with_pip_user(self):
+        rc, ran, log = self.run_repair(pip_rc=0, pipx=True)
+        self.assertEqual(rc, 0)
+        self.assertIn("python3 -m pip install --user", ran[-1])
+        self.assertNotIn("pipx", " ".join(ran[1:]))
+        self.assertTrue(log.strip().endswith("exit code 0"))
+
+    def test_falls_back_to_pipx_when_pip_refuses(self):
+        rc, ran, _ = self.run_repair(pip_rc=1, pipx=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(ran[-1], "pipx install --force seventeenlands")
+
+    def test_reinstalls_existing_pipx_venv(self):
+        rc, ran, _ = self.run_repair(pip_rc=0, pipx=True, pipx_link=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(ran[-1], "pipx reinstall seventeenlands")
+
+    def test_reports_failure(self):
+        rc, _, log = self.run_repair(pip_rc=1, pipx=False)
+        self.assertEqual(rc, 1)
+        self.assertTrue(log.strip().endswith("exit code 1"))
+
+
 class CloseHintTests(unittest.TestCase):
     def test_close_hint_shows_once(self):
         from PyQt6.QtWidgets import QApplication
